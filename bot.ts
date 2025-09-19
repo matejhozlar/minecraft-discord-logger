@@ -75,7 +75,7 @@ async function flushQueue(force = false): Promise<void> {
 
   const sendChunk = async (): Promise<void> => {
     if (current.length === 0) return;
-    const payload = "```text\n" + current.join("\n") + "\n```";
+    const payload = "text\n" + current.join("\n") + "\n";
     try {
       await channel!.send({ content: payload });
     } catch (err) {
