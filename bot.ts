@@ -19,12 +19,15 @@ const CHANNEL_ID = mustEnv("DISCORD_CHANNEL_ID");
 const RUN_SCRIPT: string = process.env.RUN_SCRIPT ?? "./run.sh";
 const MC_WORKDIR: string = process.env.MC_WORKDIR ?? process.cwd();
 
-const BATCH_INTERVAL_MS: number = toInt(process.env.BATCH_INTERVAL_MS, 3000);
-const MAX_LINES_PER_BATCH: number = toInt(process.env.MAX_LINES_PER_BATCH, 40);
+const BATCH_INTERVAL_MS = toInt(process.env.BATCH_INTERVAL_MS, 3000);
+const MAX_LINES_PER_BATCH = toInt(process.env.MAX_LINES_PER_BATCH, 40);
 
 const DISCORD_HARD_LIMIT = 2000;
 const SAFETY_HEADROOM = 10;
 const MAX_CONTENT = DISCORD_HARD_LIMIT - SAFETY_HEADROOM;
+
+const NO_RESTART_FILE = process.env.NO_RESTART_FILE ?? ".norestart";
+const STOP_GRACE_MS = toInt(process.env.STOP_GRACE_MS, 10000);
 
 const COLORS = {
   blue: 0x3498db,
@@ -49,16 +52,13 @@ function mustEnv(name: string): string {
   }
   return v;
 }
-
 function toInt(s: string | undefined, dflt: number): number {
   const n = Number(s);
   return Number.isFinite(n) ? n : dflt;
 }
-
 function sanitizeLine(line: string): string {
   return line.replaceAll("@", "@\u200B").replaceAll("```", "`\u200B``");
 }
-
 function splitToChunks(s: string, max: number): string[] {
   const out: string[] = [];
   for (let i = 0; i < s.length; i += max) out.push(s.slice(i, i + max));
@@ -73,6 +73,11 @@ async function sendEmbed(desc: string, color: number): Promise<void> {
   } catch (err) {
     console.error("[Discord] embed send failed:", err);
   }
+}
+
+function enqueue(line: string): void {
+  queue.push(sanitizeLine(line));
+  startFlushTimer();
 }
 
 async function flushQueue(force = false): Promise<void> {
@@ -98,7 +103,7 @@ async function flushQueue(force = false): Promise<void> {
   let currentLen = 0;
 
   const flushCurrent = async () => {
-    await sendPacked(current);
+    if (current.length > 0) await sendPacked(current);
     current = [];
     currentLen = 0;
   };
@@ -107,18 +112,17 @@ async function flushQueue(force = false): Promise<void> {
     const raw = queue.shift();
     if (raw == null) continue;
 
-    const line = raw;
-    if (line.length > MAX_CONTENT) {
-      const chunks = splitToChunks(line, MAX_CONTENT);
+    if (raw.length > MAX_CONTENT) {
+      const chunks = splitToChunks(raw, MAX_CONTENT);
       if (current.length > 0) await flushCurrent();
-      for (const chunk of chunks) {
-        await sendPacked([chunk]);
+      for (let i = 0; i < chunks.length; i++) {
+        const suffix = chunks.length > 1 ? ` [${i + 1}/${chunks.length}]` : "";
+        await sendPacked([chunks[i] + suffix]);
       }
       continue;
     }
 
-    const addLen = (current.length === 0 ? 0 : 1) + line.length;
-
+    const addLen = (current.length === 0 ? 0 : 1) + raw.length;
     const wouldOverflowChars = currentLen + addLen > MAX_CONTENT;
     const wouldOverflowLines = current.length + 1 > MAX_LINES_PER_BATCH;
 
@@ -126,19 +130,11 @@ async function flushQueue(force = false): Promise<void> {
       await flushCurrent();
     }
 
-    if (line.length > MAX_CONTENT) {
-      const chunks = splitToChunks(line, MAX_CONTENT);
-      for (const chunk of chunks) await sendPacked([chunk]);
-      continue;
-    }
-
-    current.push(line);
+    current.push(raw);
     currentLen += addLen;
   }
 
-  if (current.length > 0) {
-    await flushCurrent();
-  }
+  await flushCurrent();
 
   if (force && flushTimer) {
     clearInterval(flushTimer);
@@ -149,11 +145,6 @@ async function flushQueue(force = false): Promise<void> {
 function startFlushTimer(): void {
   if (flushTimer) return;
   flushTimer = setInterval(() => void flushQueue(false), BATCH_INTERVAL_MS);
-}
-
-function enqueue(line: string): void {
-  queue.push(sanitizeLine(line));
-  startFlushTimer();
 }
 
 async function ensureChannel(): Promise<TextChannel> {
@@ -209,7 +200,7 @@ function startServer(): void {
 
   server.on("close", (code: number | null, signal: NodeJS.Signals | null) => {
     void sendEmbed(
-      `**Minecraft server stopped** (code=\`${code}\`, signal=\`${
+      `**Minecraft server process ended** (code=\`${code}\`, signal=\`${
         signal ?? "null"
       }\`).`,
       COLORS.red
@@ -233,17 +224,42 @@ async function shutdown(): Promise<void> {
   await sendEmbed("**Logger shutting down…**", COLORS.yellow);
 
   try {
+    const flagPath = path.join(MC_WORKDIR, NO_RESTART_FILE);
+    fs.writeFileSync(flagPath, "1", "utf8");
+  } catch (e) {
+    console.error("[SYS] Failed to write no-restart flag:", e);
+  }
+
+  try {
+    if (server?.stdin.writable) {
+      server.stdin.write("stop\n");
+    }
+  } catch (e) {
+    console.error("[SYS] Failed to write 'stop' to server stdin:", e);
+  }
+
+  const closed = await new Promise<boolean>((resolve) => {
+    let done = false;
+    const onClose = () => {
+      if (!done) {
+        done = true;
+        resolve(true);
+      }
+    };
+    server?.once("close", onClose);
+    setTimeout(() => {
+      if (!done) resolve(false);
+    }, STOP_GRACE_MS);
+  });
+
+  if (!closed) {
+    try {
+      server?.kill("SIGTERM");
+    } catch {}
+  }
+
+  try {
     await flushQueue(true);
-  } catch {}
-
-  try {
-    if (server?.stdin.writable) server.stdin.write("stop\n");
-  } catch {}
-
-  await new Promise((r) => setTimeout(r, 8000));
-
-  try {
-    if (server && !server.killed) server.kill("SIGINT");
   } catch {}
 
   try {
@@ -262,8 +278,6 @@ process.on("unhandledRejection", (e) =>
 (async () => {
   await client.login(DISCORD_TOKEN);
   channel = await ensureChannel();
-
   await sendEmbed("**Logger online** — launching Minecraft...", COLORS.blue);
-
   startServer();
 })();
