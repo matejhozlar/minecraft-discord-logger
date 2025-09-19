@@ -5,7 +5,6 @@ import {
   ChannelType,
   EmbedBuilder,
   Message,
-  PermissionFlagsBits,
 } from "discord.js";
 import { spawn, ChildProcessWithoutNullStreams } from "node:child_process";
 import * as dotenv from "dotenv";
@@ -19,8 +18,18 @@ const DISCORD_TOKEN = mustEnv("DISCORD_TOKEN");
 const GUILD_ID = mustEnv("DISCORD_GUILD_ID");
 const CHANNEL_ID = mustEnv("DISCORD_CHANNEL_ID");
 
-const RUN_SCRIPT: string = process.env.RUN_SCRIPT ?? "./run.sh";
 const MC_WORKDIR: string = process.env.MC_WORKDIR ?? process.cwd();
+
+const JAVA_CMD = process.env.JAVA_CMD ?? "java";
+const JAVA_ARGS = (process.env.JAVA_ARGS ?? "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+const RESTART_DELAY_MS = toInt(process.env.RESTART_DELAY_MS, 10_000);
+const NO_RESTART_FILE = process.env.NO_RESTART_FILE ?? ".norestart";
+
+const STOP_GRACE_MS = toInt(process.env.STOP_GRACE_MS, 10_000);
 
 const BATCH_INTERVAL_MS = toInt(process.env.BATCH_INTERVAL_MS, 3000);
 const MAX_LINES_PER_BATCH = toInt(process.env.MAX_LINES_PER_BATCH, 40);
@@ -29,15 +38,11 @@ const DISCORD_HARD_LIMIT = 2000;
 const SAFETY_HEADROOM = 10;
 const MAX_CONTENT = DISCORD_HARD_LIMIT - SAFETY_HEADROOM;
 
-const NO_RESTART_FILE = process.env.NO_RESTART_FILE ?? ".norestart";
-const STOP_GRACE_MS = toInt(process.env.STOP_GRACE_MS, 10000);
-
 const RCON_ENABLED =
   (process.env.RCON_ENABLED ?? "false").toLowerCase() === "true";
 const RCON_HOST = process.env.RCON_HOST ?? "127.0.0.1";
 const RCON_PORT = toInt(process.env.RCON_PORT, 25575);
 const RCON_PASSWORD = process.env.RCON_PASSWORD ?? "";
-const RCON_PREFIX = process.env.RCON_PREFIX ?? "!rcon ";
 const RCON_CONNECT_TIMEOUT_MS = toInt(
   process.env.RCON_CONNECT_TIMEOUT_MS,
   5000
@@ -65,9 +70,11 @@ const client = new Client({
 
 let channel: TextChannel | null = null;
 let server: ChildProcessWithoutNullStreams | null = null;
+let restartingTimer: NodeJS.Timeout | null = null;
+let shuttingDown = false;
+
 let queue: string[] = [];
 let flushTimer: NodeJS.Timeout | null = null;
-let shuttingDown = false;
 
 function mustEnv(name: string): string {
   const v = process.env[name];
@@ -77,18 +84,22 @@ function mustEnv(name: string): string {
   }
   return v;
 }
+
 function toInt(s: string | undefined, dflt: number): number {
   const n = Number(s);
   return Number.isFinite(n) ? n : dflt;
 }
+
 function sanitizeLine(line: string): string {
   return line.replaceAll("@", "@\u200B").replaceAll("```", "`\u200B``");
 }
+
 function splitToChunks(s: string, max: number): string[] {
   const out: string[] = [];
   for (let i = 0; i < s.length; i += max) out.push(s.slice(i, i + max));
   return out;
 }
+
 async function sendEmbed(desc: string, color: number): Promise<void> {
   if (!channel) return;
   const embed = new EmbedBuilder().setDescription(desc).setColor(color);
@@ -116,10 +127,23 @@ async function flushQueue(force = false): Promise<void> {
   const sendPacked = async (lines: string[]): Promise<void> => {
     if (lines.length === 0) return;
     const content = lines.join("\n");
-    try {
-      await channel!.send({ content });
-    } catch (err) {
-      console.error("[Discord] send failed:", err);
+
+    if (content.length <= MAX_CONTENT) {
+      try {
+        await channel!.send({ content });
+      } catch (err) {
+        console.error("[Discord] send failed:", err);
+      }
+    } else {
+      const chunks = splitToChunks(content, MAX_CONTENT);
+      for (let i = 0; i < chunks.length; i++) {
+        const suffix = chunks.length > 1 ? ` [${i + 1}/${chunks.length}]` : "";
+        try {
+          await channel!.send({ content: chunks[i] + suffix });
+        } catch (err) {
+          console.error("[Discord] send failed (chunk):", err);
+        }
+      }
     }
   };
 
@@ -192,7 +216,6 @@ class RconManager {
         timeout: RCON_CONNECT_TIMEOUT_MS,
       });
       this.connected = true;
-
       this.rcon.on("end", () => {
         this.connected = false;
         this.rcon = null;
@@ -223,13 +246,11 @@ class RconManager {
     this.connected = false;
   }
 }
-
 const rconManager = new RconManager();
 
 async function ensureChannel(): Promise<TextChannel> {
   const guild = await client.guilds.fetch(GUILD_ID);
   if (!guild) throw new Error("Guild not found");
-
   const ch = await guild.channels.fetch(CHANNEL_ID);
   if (!ch || ch.type !== ChannelType.GuildText) {
     throw new Error(
@@ -244,17 +265,19 @@ function startServer(): void {
     console.error(`[FATAL] MC_WORKDIR does not exist: ${MC_WORKDIR}`);
     process.exit(1);
   }
+  try {
+    const flag = path.join(MC_WORKDIR, NO_RESTART_FILE);
+    if (fs.existsSync(flag)) fs.unlinkSync(flag);
+  } catch {}
 
-  const scriptPath = path.resolve(MC_WORKDIR, RUN_SCRIPT);
-  if (!fs.existsSync(scriptPath)) {
-    console.error(`[FATAL] run.sh not found at ${scriptPath}`);
-    process.exit(1);
-  }
-
-  console.log(`[MC] Starting script: ${scriptPath}`);
-  server = spawn("bash", [scriptPath], {
+  console.log(
+    `[MC] Starting: ${JAVA_CMD} ${JAVA_ARGS.join(" ")} (cwd=${MC_WORKDIR})`
+  );
+  server = spawn(JAVA_CMD, JAVA_ARGS, {
     cwd: MC_WORKDIR,
     env: process.env,
+    stdio: ["pipe", "pipe", "pipe"],
+    detached: false,
   });
 
   const push = (prefix: string, data: Buffer) => {
@@ -277,15 +300,26 @@ function startServer(): void {
     );
   });
 
-  server.on("close", (code: number | null, signal: NodeJS.Signals | null) => {
+  server.on("exit", (code: number | null, signal: NodeJS.Signals | null) => {
     void sendEmbed(
-      `**Minecraft server process ended** (code=\`${code}\`, signal=\`${
+      `**Minecraft server stopped** (code=\`${code}\`, signal=\`${
         signal ?? "null"
       }\`).`,
       COLORS.red
     );
     void flushQueue(true);
     server = null;
+
+    const noRestartFlag = path.join(MC_WORKDIR, NO_RESTART_FILE);
+    const shouldRestart = !shuttingDown && !fs.existsSync(noRestartFlag);
+
+    if (shouldRestart) {
+      if (restartingTimer) clearTimeout(restartingTimer);
+      restartingTimer = setTimeout(() => {
+        restartingTimer = null;
+        startServer();
+      }, RESTART_DELAY_MS);
+    }
   });
 }
 
@@ -301,6 +335,11 @@ async function shutdown(): Promise<void> {
 
   console.log("[SYS] Shutting down…");
   await sendEmbed("**Logger shutting down…**", COLORS.yellow);
+
+  if (restartingTimer) {
+    clearTimeout(restartingTimer);
+    restartingTimer = null;
+  }
 
   try {
     const flagPath = path.join(MC_WORKDIR, NO_RESTART_FILE);
@@ -325,7 +364,7 @@ async function shutdown(): Promise<void> {
         resolve(true);
       }
     };
-    server?.once("close", onClose);
+    server?.once("exit", onClose);
     setTimeout(() => {
       if (!done) resolve(false);
     }, STOP_GRACE_MS);
@@ -333,18 +372,20 @@ async function shutdown(): Promise<void> {
 
   if (!closed) {
     try {
-      server?.kill("SIGTERM");
+      if (server && server.pid) process.kill(server.pid, "SIGINT");
+    } catch {}
+    await new Promise((r) => setTimeout(r, 2000));
+    try {
+      if (server && server.pid) process.kill(server.pid, "SIGKILL");
     } catch {}
   }
 
   try {
     await flushQueue(true);
   } catch {}
-
   try {
     await rconManager.close();
   } catch {}
-
   try {
     await client.destroy();
   } catch {}
@@ -359,60 +400,60 @@ process.on("unhandledRejection", (e) =>
 );
 
 client.on("messageCreate", async (msg: Message) => {
-  try {
-    if (!RCON_ENABLED) return;
-    if (msg.author.bot) return;
-    if (msg.channelId !== CHANNEL_ID) return;
+  if (!RCON_ENABLED) return;
+  if (msg.author.bot) return;
+  if (msg.channelId !== CHANNEL_ID) return;
 
-    const content = msg.content ?? "";
-    if (!content.startsWith(RCON_PREFIX)) return;
-
-    if (RCON_ALLOWED_USER_IDS.length > 0) {
-      if (!RCON_ALLOWED_USER_IDS.includes(msg.author.id)) {
-        await msg.reply("❌ You are not allowed to use RCON here.");
-        return;
-      }
-    }
-    if (RCON_ALLOWED_ROLE_ID) {
-      const member = await msg.guild?.members
-        .fetch(msg.author.id)
-        .catch(() => null);
-      const hasRole = member?.roles.cache.has(RCON_ALLOWED_ROLE_ID);
-      if (!hasRole) {
-        await msg.reply("❌ You are not allowed to use RCON here.");
-        return;
-      }
-    }
-
-    const command = content.slice(RCON_PREFIX.length).trim();
-    if (!command) {
-      await msg.reply(`ℹ️ Usage: \`${RCON_PREFIX}<minecraft command>\``);
+  if (
+    RCON_ALLOWED_USER_IDS.length > 0 &&
+    !RCON_ALLOWED_USER_IDS.includes(msg.author.id)
+  ) {
+    await safeReply(msg, "❌ You are not allowed to use RCON here.");
+    return;
+  }
+  if (RCON_ALLOWED_ROLE_ID) {
+    const member = await msg.guild?.members
+      .fetch(msg.author.id)
+      .catch(() => null);
+    if (!member?.roles.cache.has(RCON_ALLOWED_ROLE_ID)) {
+      await safeReply(msg, "❌ You are not allowed to use RCON here.");
       return;
     }
+  }
 
+  const command = (msg.content ?? "").trim();
+  if (!command) return;
+
+  try {
     if (
       "sendTyping" in msg.channel &&
       typeof msg.channel.sendTyping === "function"
     ) {
       await msg.channel.sendTyping();
     }
-
     const result = await rconManager.send(command);
     const reply = (result ?? "").toString().trim() || "✅ Executed (no output)";
 
-    const chunks = splitToChunks("```" + reply + "```", DISCORD_HARD_LIMIT - 1);
+    const fence = "```";
+    const max = DISCORD_HARD_LIMIT - fence.length * 2 - 1;
+    const chunks = splitToChunks(reply, max);
     for (const c of chunks) {
-      await msg.reply({ content: c });
+      await msg.reply({ content: `${fence}${c}${fence}` });
     }
   } catch (err: any) {
     console.error("[RCON] Error:", err);
-    try {
-      await msg.reply(
-        `❌ RCON error: \`${(err?.message ?? String(err)).slice(0, 1800)}\``
-      );
-    } catch {}
+    await safeReply(
+      msg,
+      `❌ RCON error: \`${(err?.message ?? String(err)).slice(0, 1800)}\``
+    );
   }
 });
+
+async function safeReply(msg: Message, content: string) {
+  try {
+    await msg.reply({ content });
+  } catch {}
+}
 
 (async () => {
   await client.login(DISCORD_TOKEN);
