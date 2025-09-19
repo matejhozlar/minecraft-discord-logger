@@ -4,11 +4,14 @@ import {
   TextChannel,
   ChannelType,
   EmbedBuilder,
+  Message,
+  PermissionFlagsBits,
 } from "discord.js";
 import { spawn, ChildProcessWithoutNullStreams } from "node:child_process";
 import * as dotenv from "dotenv";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { Rcon } from "rcon-client";
 
 dotenv.config();
 
@@ -29,6 +32,22 @@ const MAX_CONTENT = DISCORD_HARD_LIMIT - SAFETY_HEADROOM;
 const NO_RESTART_FILE = process.env.NO_RESTART_FILE ?? ".norestart";
 const STOP_GRACE_MS = toInt(process.env.STOP_GRACE_MS, 10000);
 
+const RCON_ENABLED =
+  (process.env.RCON_ENABLED ?? "false").toLowerCase() === "true";
+const RCON_HOST = process.env.RCON_HOST ?? "127.0.0.1";
+const RCON_PORT = toInt(process.env.RCON_PORT, 25575);
+const RCON_PASSWORD = process.env.RCON_PASSWORD ?? "";
+const RCON_PREFIX = process.env.RCON_PREFIX ?? "!rcon ";
+const RCON_CONNECT_TIMEOUT_MS = toInt(
+  process.env.RCON_CONNECT_TIMEOUT_MS,
+  5000
+);
+const RCON_ALLOWED_ROLE_ID = process.env.RCON_ALLOWED_ROLE_ID ?? "";
+const RCON_ALLOWED_USER_IDS = (process.env.RCON_ALLOWED_USER_IDS ?? "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
 const COLORS = {
   blue: 0x3498db,
   green: 0x2ecc71,
@@ -36,7 +55,13 @@ const COLORS = {
   red: 0xe74c3c,
 } as const;
 
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+  ],
+});
 
 let channel: TextChannel | null = null;
 let server: ChildProcessWithoutNullStreams | null = null;
@@ -64,7 +89,6 @@ function splitToChunks(s: string, max: number): string[] {
   for (let i = 0; i < s.length; i += max) out.push(s.slice(i, i + max));
   return out;
 }
-
 async function sendEmbed(desc: string, color: number): Promise<void> {
   if (!channel) return;
   const embed = new EmbedBuilder().setDescription(desc).setColor(color);
@@ -146,6 +170,61 @@ function startFlushTimer(): void {
   if (flushTimer) return;
   flushTimer = setInterval(() => void flushQueue(false), BATCH_INTERVAL_MS);
 }
+
+class RconManager {
+  private rcon: Rcon | null = null;
+  private connected = false;
+  private connecting = false;
+
+  async ensureConnected(): Promise<void> {
+    if (!RCON_ENABLED) throw new Error("RCON is disabled");
+    if (this.connected && this.rcon) return;
+    if (this.connecting) {
+      await new Promise((r) => setTimeout(r, 250));
+      if (this.connected && this.rcon) return;
+    }
+    this.connecting = true;
+    try {
+      this.rcon = await Rcon.connect({
+        host: RCON_HOST,
+        port: RCON_PORT,
+        password: RCON_PASSWORD,
+        timeout: RCON_CONNECT_TIMEOUT_MS,
+      });
+      this.connected = true;
+
+      this.rcon.on("end", () => {
+        this.connected = false;
+        this.rcon = null;
+      });
+    } finally {
+      this.connecting = false;
+    }
+  }
+
+  async send(command: string): Promise<string> {
+    await this.ensureConnected();
+    if (!this.rcon) throw new Error("RCON not connected");
+    try {
+      const res = await this.rcon.send(command);
+      return typeof res === "string" ? res : String(res);
+    } catch (e) {
+      this.connected = false;
+      this.rcon = null;
+      throw e;
+    }
+  }
+
+  async close(): Promise<void> {
+    try {
+      await this.rcon?.end();
+    } catch {}
+    this.rcon = null;
+    this.connected = false;
+  }
+}
+
+const rconManager = new RconManager();
 
 async function ensureChannel(): Promise<TextChannel> {
   const guild = await client.guilds.fetch(GUILD_ID);
@@ -263,6 +342,10 @@ async function shutdown(): Promise<void> {
   } catch {}
 
   try {
+    await rconManager.close();
+  } catch {}
+
+  try {
     await client.destroy();
   } catch {}
 
@@ -274,6 +357,62 @@ process.on("SIGTERM", () => void shutdown());
 process.on("unhandledRejection", (e) =>
   console.error("[SYS] Unhandled rejection:", e)
 );
+
+client.on("messageCreate", async (msg: Message) => {
+  try {
+    if (!RCON_ENABLED) return;
+    if (msg.author.bot) return;
+    if (msg.channelId !== CHANNEL_ID) return;
+
+    const content = msg.content ?? "";
+    if (!content.startsWith(RCON_PREFIX)) return;
+
+    if (RCON_ALLOWED_USER_IDS.length > 0) {
+      if (!RCON_ALLOWED_USER_IDS.includes(msg.author.id)) {
+        await msg.reply("❌ You are not allowed to use RCON here.");
+        return;
+      }
+    }
+    if (RCON_ALLOWED_ROLE_ID) {
+      const member = await msg.guild?.members
+        .fetch(msg.author.id)
+        .catch(() => null);
+      const hasRole = member?.roles.cache.has(RCON_ALLOWED_ROLE_ID);
+      if (!hasRole) {
+        await msg.reply("❌ You are not allowed to use RCON here.");
+        return;
+      }
+    }
+
+    const command = content.slice(RCON_PREFIX.length).trim();
+    if (!command) {
+      await msg.reply(`ℹ️ Usage: \`${RCON_PREFIX}<minecraft command>\``);
+      return;
+    }
+
+    if (
+      "sendTyping" in msg.channel &&
+      typeof msg.channel.sendTyping === "function"
+    ) {
+      await msg.channel.sendTyping();
+    }
+
+    const result = await rconManager.send(command);
+    const reply = (result ?? "").toString().trim() || "✅ Executed (no output)";
+
+    const chunks = splitToChunks("```" + reply + "```", DISCORD_HARD_LIMIT - 1);
+    for (const c of chunks) {
+      await msg.reply({ content: c });
+    }
+  } catch (err: any) {
+    console.error("[RCON] Error:", err);
+    try {
+      await msg.reply(
+        `❌ RCON error: \`${(err?.message ?? String(err)).slice(0, 1800)}\``
+      );
+    } catch {}
+  }
+});
 
 (async () => {
   await client.login(DISCORD_TOKEN);
