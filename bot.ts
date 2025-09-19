@@ -21,7 +21,10 @@ const MC_WORKDIR: string = process.env.MC_WORKDIR ?? process.cwd();
 
 const BATCH_INTERVAL_MS: number = toInt(process.env.BATCH_INTERVAL_MS, 3000);
 const MAX_LINES_PER_BATCH: number = toInt(process.env.MAX_LINES_PER_BATCH, 40);
-const MAX_DISCORD_CHARS: number = toInt(process.env.MAX_DISCORD_CHARS, 1800);
+
+const DISCORD_HARD_LIMIT = 2000;
+const SAFETY_HEADROOM = 10;
+const MAX_CONTENT = DISCORD_HARD_LIMIT - SAFETY_HEADROOM;
 
 const COLORS = {
   blue: 0x3498db,
@@ -30,14 +33,13 @@ const COLORS = {
   red: 0xe74c3c,
 } as const;
 
-const client = new Client({
-  intents: [GatewayIntentBits.Guilds],
-});
+const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
 let channel: TextChannel | null = null;
 let server: ChildProcessWithoutNullStreams | null = null;
 let queue: string[] = [];
 let flushTimer: NodeJS.Timeout | null = null;
+let shuttingDown = false;
 
 function mustEnv(name: string): string {
   const v = process.env[name];
@@ -57,6 +59,12 @@ function sanitizeLine(line: string): string {
   return line.replaceAll("@", "@\u200B").replaceAll("```", "`\u200B``");
 }
 
+function splitToChunks(s: string, max: number): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < s.length; i += max) out.push(s.slice(i, i + max));
+  return out;
+}
+
 async function sendEmbed(desc: string, color: number): Promise<void> {
   if (!channel) return;
   const embed = new EmbedBuilder().setDescription(desc).setColor(color);
@@ -68,38 +76,69 @@ async function sendEmbed(desc: string, color: number): Promise<void> {
 }
 
 async function flushQueue(force = false): Promise<void> {
-  if (!channel || queue.length === 0) return;
+  if (!channel || queue.length === 0) {
+    if (force && flushTimer) {
+      clearInterval(flushTimer);
+      flushTimer = null;
+    }
+    return;
+  }
+
+  const sendPacked = async (lines: string[]): Promise<void> => {
+    if (lines.length === 0) return;
+    const content = lines.join("\n");
+    try {
+      await channel!.send({ content });
+    } catch (err) {
+      console.error("[Discord] send failed:", err);
+    }
+  };
 
   let current: string[] = [];
   let currentLen = 0;
 
-  const sendChunk = async (): Promise<void> => {
-    if (current.length === 0) return;
-    const payload = "text\n" + current.join("\n") + "\n";
-    try {
-      await channel!.send({ content: payload });
-    } catch (err) {
-      console.error("[Discord] send failed:", err);
-    } finally {
-      current = [];
-      currentLen = 0;
-    }
+  const flushCurrent = async () => {
+    await sendPacked(current);
+    current = [];
+    currentLen = 0;
   };
 
   while (queue.length > 0) {
-    const line = queue.shift();
-    if (line === undefined) continue;
+    const raw = queue.shift();
+    if (raw == null) continue;
 
-    const addLen = line.length + 1;
-    const wouldOverflowChars = currentLen + addLen + 8 > MAX_DISCORD_CHARS;
-    const wouldOverflowLines = current.length + 1 > MAX_LINES_PER_BATCH;
-    if (wouldOverflowChars || wouldOverflowLines) {
-      await sendChunk();
+    const line = raw;
+    if (line.length > MAX_CONTENT) {
+      const chunks = splitToChunks(line, MAX_CONTENT);
+      if (current.length > 0) await flushCurrent();
+      for (const chunk of chunks) {
+        await sendPacked([chunk]);
+      }
+      continue;
     }
+
+    const addLen = (current.length === 0 ? 0 : 1) + line.length;
+
+    const wouldOverflowChars = currentLen + addLen > MAX_CONTENT;
+    const wouldOverflowLines = current.length + 1 > MAX_LINES_PER_BATCH;
+
+    if (wouldOverflowChars || wouldOverflowLines) {
+      await flushCurrent();
+    }
+
+    if (line.length > MAX_CONTENT) {
+      const chunks = splitToChunks(line, MAX_CONTENT);
+      for (const chunk of chunks) await sendPacked([chunk]);
+      continue;
+    }
+
     current.push(line);
     currentLen += addLen;
   }
-  await sendChunk();
+
+  if (current.length > 0) {
+    await flushCurrent();
+  }
 
   if (force && flushTimer) {
     clearInterval(flushTimer);
@@ -110,6 +149,11 @@ async function flushQueue(force = false): Promise<void> {
 function startFlushTimer(): void {
   if (flushTimer) return;
   flushTimer = setInterval(() => void flushQueue(false), BATCH_INTERVAL_MS);
+}
+
+function enqueue(line: string): void {
+  queue.push(sanitizeLine(line));
+  startFlushTimer();
 }
 
 async function ensureChannel(): Promise<TextChannel> {
@@ -149,9 +193,8 @@ function startServer(): void {
       .split(/\r?\n/)
       .forEach((line) => {
         if (!line.trim()) return;
-        queue.push(sanitizeLine(`${prefix} ${line}`));
+        enqueue(`${prefix} ${line}`);
       });
-    startFlushTimer();
   };
 
   server.stdout.on("data", (d: Buffer) => push("[OUT]", d));
@@ -182,25 +225,39 @@ process.stdin.on("data", (chunk: string) => {
   server.stdin.write(chunk);
 });
 
-async function shutdown(): Promise<never> {
+async function shutdown(): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
+
   console.log("[SYS] Shutting down…");
   await sendEmbed("**Logger shutting down…**", COLORS.yellow);
+
   try {
     await flushQueue(true);
   } catch {}
+
+  try {
+    if (server?.stdin.writable) server.stdin.write("stop\n");
+  } catch {}
+
+  await new Promise((r) => setTimeout(r, 8000));
+
+  try {
+    if (server && !server.killed) server.kill("SIGINT");
+  } catch {}
+
   try {
     await client.destroy();
   } catch {}
-  try {
-    if (server?.stdin.writable) server.stdin.write("stop\n");
-    await new Promise((r) => setTimeout(r, 8000));
-    if (server && !server.killed) server.kill("SIGINT");
-  } catch {}
+
   process.exit(0);
 }
 
-process.on("SIGINT", shutdown);
-process.on("SIGTERM", shutdown);
+process.on("SIGINT", () => void shutdown());
+process.on("SIGTERM", () => void shutdown());
+process.on("unhandledRejection", (e) =>
+  console.error("[SYS] Unhandled rejection:", e)
+);
 
 (async () => {
   await client.login(DISCORD_TOKEN);
