@@ -53,6 +53,9 @@ const RCON_ALLOWED_USER_IDS = (process.env.RCON_ALLOWED_USER_IDS ?? "")
   .map((s) => s.trim())
   .filter(Boolean);
 
+const ECHO_TO_CONSOLE =
+  (process.env.ECHO_TO_CONSOLE ?? "true").toLowerCase() === "true";
+
 const COLORS = {
   blue: 0x3498db,
   green: 0x2ecc71,
@@ -101,6 +104,7 @@ function splitToChunks(s: string, max: number): string[] {
 }
 
 async function sendEmbed(desc: string, color: number): Promise<void> {
+  if (ECHO_TO_CONSOLE) process.stdout.write(`[EMBED] ${desc}\n`);
   if (!channel) return;
   const embed = new EmbedBuilder().setDescription(desc).setColor(color);
   try {
@@ -111,7 +115,9 @@ async function sendEmbed(desc: string, color: number): Promise<void> {
 }
 
 function enqueue(line: string): void {
-  queue.push(sanitizeLine(line));
+  const safe = sanitizeLine(line);
+  if (ECHO_TO_CONSOLE) process.stdout.write(safe + "\n");
+  queue.push(safe);
   startFlushTimer();
 }
 
@@ -265,6 +271,7 @@ function startServer(): void {
     console.error(`[FATAL] MC_WORKDIR does not exist: ${MC_WORKDIR}`);
     process.exit(1);
   }
+
   try {
     const flag = path.join(MC_WORKDIR, NO_RESTART_FILE);
     if (fs.existsSync(flag)) fs.unlinkSync(flag);
